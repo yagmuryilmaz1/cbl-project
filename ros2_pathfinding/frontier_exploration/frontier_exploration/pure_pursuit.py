@@ -1,47 +1,48 @@
 #!/usr/bin/env python3
 
 import math
-import rospy
+import rclpy
+from rclpy.node import Node
 import numpy as np
 from path_planner import PathPlanner
 from std_msgs.msg import Header, Bool
 from nav_msgs.msg import Path, Odometry, GridCells, OccupancyGrid
 from geometry_msgs.msg import Point, PointStamped, Twist, Vector3, Pose, Quaternion
-from tf.transformations import euler_from_quaternion
-from tf import TransformListener
+import tf_transformations
+from tf2_ros import TransformListener, Buffer
+from tf2_ros import TransformException
 
 
-class PurePursuit:
+class PurePursuit(Node):
     def __init__(self):
         """
         Class constructor
         """
-        rospy.init_node("pure_pursuit")
+        super().__init__('pure_pursuit')
 
         # Set if in debug mode
-        self.is_in_debug_mode = (
-            rospy.has_param("~debug") and rospy.get_param("~debug") == "true"
-        )
+        self.declare_parameter('debug', False)
+        self.is_in_debug_mode = self.get_parameter('debug').value
 
         # Publishers
-        self.cmd_vel = rospy.Publisher("/cmd_vel", Twist, queue_size=10)
-        self.lookahead_pub = rospy.Publisher(
-            "/pure_pursuit/lookahead", PointStamped, queue_size=10
+        self.cmd_vel = self.create_publisher(Twist, '/cmd_vel', 10)
+        self.lookahead_pub = self.create_publisher(
+            PointStamped, '/pure_pursuit/lookahead', 10
         )
 
         if self.is_in_debug_mode:
-            self.fov_cells_pub = rospy.Publisher(
-                "/pure_pursuit/fov_cells", GridCells, queue_size=100
+            self.fov_cells_pub = self.create_publisher(
+                GridCells, '/pure_pursuit/fov_cells', 100
             )
-            self.close_wall_cells_pub = rospy.Publisher(
-                "/pure_pursuit/close_wall_cells", GridCells, queue_size=100
+            self.close_wall_cells_pub = self.create_publisher(
+                GridCells, '/pure_pursuit/close_wall_cells', 100
             )
 
         # Subscribers
-        rospy.Subscriber("/odom", Odometry, self.update_odometry)
-        rospy.Subscriber("/map", OccupancyGrid, self.update_map)
-        rospy.Subscriber("/pure_pursuit/path", Path, self.update_path)
-        rospy.Subscriber("/pure_pursuit/enabled", Bool, self.update_enabled)
+        self.create_subscription(Odometry, '/odom', self.update_odometry, 10)
+        self.create_subscription(OccupancyGrid, '/map', self.update_map, 10)
+        self.create_subscription(Path, '/pure_pursuit/path', self.update_path, 10)
+        self.create_subscription(Bool, '/pure_pursuit/enabled', self.update_enabled, 10)
 
         # Pure pursuit parameters
         self.LOOKAHEAD_DISTANCE = 0.18  # m
@@ -62,7 +63,8 @@ class PurePursuit:
         self.SMALL_FOV = 300  # degrees
         self.SMALL_FOV_DISTANCE = 10  # Number of grid cells
 
-        self.tf_listener = TransformListener()
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
         self.pose = None
         self.map = None
         self.path = Path()
@@ -76,15 +78,18 @@ class PurePursuit:
         Updates the current pose of the robot.
         """
         try:
-            (trans, rot) = self.tf_listener.lookupTransform(
-                "/map", "/base_footprint", rospy.Time(0)
+            transform = self.tf_buffer.lookup_transform(
+                'map', 'base_footprint', rclpy.time.Time()
             )
-        except:
+            trans = transform.transform.translation
+            rot = transform.transform.rotation
+        except TransformException as ex:
+            self.get_logger().warn(f'Could not transform: {ex}')
             return
 
         self.pose = Pose(
-            position=Point(x=trans[0], y=trans[1]),
-            orientation=Quaternion(x=rot[0], y=rot[1], z=rot[2], w=rot[3]),
+            position=Point(x=trans.x, y=trans.y),
+            orientation=Quaternion(x=rot.x, y=rot.y, z=rot.z, w=rot.w),
         )
 
     def update_map(self, msg: OccupancyGrid):
@@ -106,7 +111,7 @@ class PurePursuit:
             return 0
 
         orientation = self.pose.orientation
-        roll, pitch, yaw = euler_from_quaternion(
+        roll, pitch, yaw = tf_transformations.euler_from_quaternion(
             [orientation.x, orientation.y, orientation.z, orientation.w]
         )
         yaw = float(np.rad2deg(yaw))
@@ -198,6 +203,7 @@ class PurePursuit:
         steering_adjustment = (
             -self.OBSTACLE_AVOIDANCE_GAIN * average_angle / wall_cell_count
         )
+
         return steering_adjustment
 
     @staticmethod
@@ -205,141 +211,159 @@ class PurePursuit:
         return math.sqrt((x1 - x0) ** 2 + (y1 - y0) ** 2)
 
     def get_distance_to_waypoint_index(self, i: int) -> float:
-        if self.pose is None or self.path.poses is None:
-            return -1
+        if self.pose is None or len(self.path.poses) == 0:
+            return float("inf")
 
-        position = self.pose.position
         waypoint = self.path.poses[i].pose.position
-        return PurePursuit.distance(position.x, position.y, waypoint.x, waypoint.y)
+        return PurePursuit.distance(
+            self.pose.position.x,
+            self.pose.position.y,
+            waypoint.x,
+            waypoint.y,
+        )
 
     def find_nearest_waypoint_index(self) -> int:
-        nearest_waypoint_index = -1
-        if self.path.poses is None:
-            return nearest_waypoint_index
+        if self.pose is None or len(self.path.poses) == 0:
+            return 0
 
-        closest_distance = float("inf")
-        for i in range(len(self.path.poses) - 1):
+        min_distance = float("inf")
+        min_index = 0
+
+        for i in range(len(self.path.poses)):
             distance = self.get_distance_to_waypoint_index(i)
-            if distance and distance < closest_distance:
-                closest_distance = distance
-                nearest_waypoint_index = i
-        return nearest_waypoint_index
+            if distance < min_distance:
+                min_distance = distance
+                min_index = i
+
+        return min_index
 
     def find_lookahead(self, nearest_waypoint_index, lookahead_distance) -> Point:
-        if self.path.poses is None:
+        if self.pose is None or len(self.path.poses) == 0:
             return Point()
 
-        i = nearest_waypoint_index
-        while (
-            i < len(self.path.poses)
-            and self.get_distance_to_waypoint_index(i) < lookahead_distance
-        ):
-            i += 1
-        return self.path.poses[i - 1].pose.position
+        for i in range(nearest_waypoint_index, len(self.path.poses)):
+            waypoint = self.path.poses[i].pose.position
+            distance = PurePursuit.distance(
+                self.pose.position.x,
+                self.pose.position.y,
+                waypoint.x,
+                waypoint.y,
+            )
+            if distance >= lookahead_distance:
+                return waypoint
+
+        return self.path.poses[-1].pose.position
 
     def get_goal(self) -> Point:
-        if self.path.poses is None:
+        if self.pose is None or len(self.path.poses) == 0:
             return Point()
 
-        poses = self.path.poses
-        return poses[len(poses) - 1].pose.position
+        nearest_waypoint_index = self.find_nearest_waypoint_index()
+        lookahead = self.find_lookahead(nearest_waypoint_index, self.LOOKAHEAD_DISTANCE)
+
+        return lookahead
 
     def send_speed(self, linear_speed: float, angular_speed: float):
-        """
-        Sends the speeds to the motors.
-        :param linear_speed  [float] [m/s]   The forward linear speed.
-        :param angular_speed [float] [rad/s] The angular speed for rotating around the body center.
-        """
-        twist = Twist(linear=Vector3(x=linear_speed), angular=Vector3(z=angular_speed))
+        if not self.enabled:
+            return
+
+        twist = Twist()
+        twist.linear = Vector3(x=linear_speed, y=0.0, z=0.0)
+        twist.angular = Vector3(x=0.0, y=0.0, z=angular_speed)
         self.cmd_vel.publish(twist)
 
     def stop(self):
         self.send_speed(0, 0)
 
     def run(self):
-        rospy.sleep(5)
-
-        while not rospy.is_shutdown():
-            if self.pose is None:
+        rate = self.create_rate(20)  # Hz
+        while rclpy.ok():
+            if self.pose is None or self.map is None or len(self.path.poses) == 0:
+                rate.sleep()
                 continue
 
-            # If not enabled, do nothing
-            if not self.enabled:
-                continue
-
-            # If no path, stop
-            if self.path is None or not self.path.poses:
-                self.stop()
-                continue
-
+            # Get the goal point
             goal = self.get_goal()
 
-            nearest_waypoint_index = self.find_nearest_waypoint_index()
-            lookahead = self.find_lookahead(
-                nearest_waypoint_index, self.LOOKAHEAD_DISTANCE
+            # Calculate the distance to the goal
+            distance = PurePursuit.distance(
+                self.pose.position.x,
+                self.pose.position.y,
+                goal.x,
+                goal.y,
             )
 
-            self.lookahead_pub.publish(
-                PointStamped(header=Header(frame_id="map"), point=lookahead)
-            )
-
-            # Calculate alpha (angle between target and current position)
-            position = self.pose.position
-            orientation = self.pose.orientation
-            roll, pitch, yaw = euler_from_quaternion(
-                [orientation.x, orientation.y, orientation.z, orientation.w]
-            )
-            x = position.x
-            y = position.y
-            dx = lookahead.x - x
-            dy = lookahead.y - y
-            self.alpha = float(np.arctan2(dy, dx) - yaw)
-            if self.alpha > np.pi:
-                self.alpha -= 2 * np.pi
-            elif self.alpha < -np.pi:
-                self.alpha += 2 * np.pi
-
-            # If the lookahead is behind the robot, follow the path backwards
-            self.reversed = abs(self.alpha) > np.pi / 2
-
-            # Calculate the lookahead distance and center of curvature
-            lookahead_distance = PurePursuit.distance(x, y, lookahead.x, lookahead.y)
-            radius_of_curvature = float(lookahead_distance / (2 * np.sin(self.alpha)))
-
-            # Calculate drive speed
-            drive_speed = (-1 if self.reversed else 1) * self.MAX_DRIVE_SPEED
-
-            # Stop if at goal
-            distance_to_goal = PurePursuit.distance(x, y, goal.x, goal.y)
-            if distance_to_goal < self.DISTANCE_TOLERANCE:
+            # If we're close enough to the goal, stop
+            if distance < self.DISTANCE_TOLERANCE:
                 self.stop()
+                rate.sleep()
                 continue
 
-            # Calculate turn speed
-            turn_speed = self.TURN_SPEED_KP * drive_speed / radius_of_curvature
+            # Calculate the angle to the goal
+            angle = math.atan2(
+                goal.y - self.pose.position.y, goal.x - self.pose.position.x
+            )
 
-            # Obstacle avoicance
-            turn_speed += self.calculate_steering_adjustment()
+            # Get the current orientation
+            orientation = self.pose.orientation
+            roll, pitch, yaw = tf_transformations.euler_from_quaternion(
+                [orientation.x, orientation.y, orientation.z, orientation.w]
+            )
 
-            # Clamp turn speed
-            turn_speed = max(-self.MAX_TURN_SPEED, min(self.MAX_TURN_SPEED, turn_speed))
+            # Calculate the angle difference
+            angle_diff = angle - yaw
 
-            # Slow down if close to obstacle
+            # Keep angle difference in the range of -pi to pi
+            if angle_diff > math.pi:
+                angle_diff -= 2 * math.pi
+            elif angle_diff < -math.pi:
+                angle_diff += 2 * math.pi
+
+            # Calculate the steering adjustment
+            steering_adjustment = self.calculate_steering_adjustment()
+
+            # Calculate the angular speed
+            angular_speed = self.TURN_SPEED_KP * angle_diff + steering_adjustment
+
+            # Limit the angular speed
+            if angular_speed > self.MAX_TURN_SPEED:
+                angular_speed = self.MAX_TURN_SPEED
+            elif angular_speed < -self.MAX_TURN_SPEED:
+                angular_speed = -self.MAX_TURN_SPEED
+
+            # Calculate the linear speed
+            linear_speed = self.MAX_DRIVE_SPEED
+
+            # Slow down if we're close to a wall
             if self.closest_distance < self.OBSTACLE_AVOIDANCE_MAX_SLOW_DOWN_DISTANCE:
-                drive_speed *= float(
-                    np.interp(
-                        self.closest_distance,
-                        [
-                            self.OBSTACLE_AVOIDANCE_MIN_SLOW_DOWN_DISTANCE,
-                            self.OBSTACLE_AVOIDANCE_MAX_SLOW_DOWN_DISTANCE,
-                        ],
-                        [self.OBSTACLE_AVOIDANCE_MIN_SLOW_DOWN_FACTOR, 1],
+                slow_down_factor = 1.0
+                if self.closest_distance < self.OBSTACLE_AVOIDANCE_MIN_SLOW_DOWN_DISTANCE:
+                    slow_down_factor = self.OBSTACLE_AVOIDANCE_MIN_SLOW_DOWN_FACTOR
+                else:
+                    slow_down_factor = (
+                        self.closest_distance
+                        - self.OBSTACLE_AVOIDANCE_MIN_SLOW_DOWN_DISTANCE
+                    ) / (
+                        self.OBSTACLE_AVOIDANCE_MAX_SLOW_DOWN_DISTANCE
+                        - self.OBSTACLE_AVOIDANCE_MIN_SLOW_DOWN_DISTANCE
                     )
-                )
+                linear_speed *= slow_down_factor
 
-            # Send speed
-            self.send_speed(drive_speed, turn_speed)
+            # Send the speed
+            self.send_speed(linear_speed, angular_speed)
 
+            rate.sleep()
 
-if __name__ == "__main__":
-    PurePursuit().run()
+def main(args=None):
+    rclpy.init(args=args)
+    node = PurePursuit()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
