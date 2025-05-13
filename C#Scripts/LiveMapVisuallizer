@@ -1,0 +1,61 @@
+using UnityEngine;
+using Unity.Robotics.ROSTCPConnector;
+using Unity.Robotics.ROSTCPConnector.MessageTypes.Nav;
+using System.Collections.Generic;
+
+public class LiveMapVisualizer : MonoBehaviour
+{
+    public GameObject wallPrefab;
+    public float wallHeight = 1.5f;
+
+    private float resolution;
+    private int width, height;
+    private Vector3 origin;
+    private List<GameObject> spawnedWalls = new List<GameObject>();
+
+    void Start()
+    {
+        ROSConnection.GetOrCreateInstance().Subscribe<OccupancyGridMsg>("/map", OnMapReceived);
+    }
+
+    void OnMapReceived(OccupancyGridMsg msg)
+    {
+        // Clear old walls
+        foreach (GameObject wall in spawnedWalls)
+        {
+            Destroy(wall);
+        }
+        spawnedWalls.Clear();
+
+        // Read map info
+        resolution = msg.info.resolution;
+        width = (int)msg.info.width;
+        height = (int)msg.info.height;
+        origin = new Vector3((float)msg.info.origin.position.x, 0f, (float)msg.info.origin.position.y);
+
+        // Convert flat array to grid and spawn walls
+        sbyte[] data = msg.data;
+        for (int y = 0; y < height; y++)
+        {
+            for (int x = 0; x < width; x++)
+            {
+                int i = x + y * width;
+                sbyte cell = data[i];
+
+                if (cell == 100) // 100 = occupied
+                {
+                    Vector3 position = new Vector3(
+                        x * resolution,
+                        wallHeight / 2f,
+                        y * resolution
+                    ) + origin;
+
+                    GameObject wall = Instantiate(wallPrefab, position, Quaternion.identity, this.transform);
+                    spawnedWalls.Add(wall);
+                }
+            }
+        }
+
+        Debug.Log($"Spawned {spawnedWalls.Count} wall blocks from /map");
+    }
+}
