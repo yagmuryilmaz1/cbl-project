@@ -12,6 +12,7 @@ public class MapVisualizer : MonoBehaviour
     [Header("Wall Settings")]
     public GameObject wallPrefab;
     public float wallHeight = 1.5f;
+    public float wallSpawnY = 0.0f; 
 
 #if ROS_PRESENT
     // Internal map state
@@ -32,6 +33,7 @@ public class MapVisualizer : MonoBehaviour
 void Start()
 {
     ROSConnection.GetOrCreateInstance().Subscribe<OccupancyGridMsg>("/map", OnMapReceived);
+    
 
 }
 #endif
@@ -79,7 +81,7 @@ void Start()
                 float worldX = x * resolution;
                 float worldZ = y * resolution;
                 Vector3 mapOffset = new Vector3(-width * resolution / 2f, 0, -height * resolution / 2f);
-                Vector3 pos = new Vector3(worldX, wallHeight / 2f, worldZ) + mapOffset;
+                Vector3 pos = new Vector3(worldX, wallSpawnY + wallHeight / 2f, worldZ) + mapOffset;
 
                 if (float.IsNaN(pos.x) || float.IsInfinity(pos.x) || float.IsNaN(pos.z))
                 {
